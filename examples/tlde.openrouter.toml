@@ -1,0 +1,43 @@
+# OpenRouter profile — OPEN-WEIGHT models only.
+#
+# Use with:   tlde "<prompt>" --config examples/tlde.openrouter.toml
+# or:         make openrouter
+#
+# Put your key in .env (auto-loaded, gitignored):   OPENROUTER_API_KEY=sk-or-...
+#
+# Model IDs are provider-specific AND track OpenRouter's LIVE catalog — they go
+# stale as models are versioned (e.g. glm-5 → glm-5.1). The slugs below reflect
+# the catalog as of 2026-06; if a run reports "Model '<id>' is not available",
+# list the current IDs and update this file:
+#
+#   curl -s https://openrouter.ai/api/v1/models | python -m json.tool | grep '"id"'
+#
+# All selections are open-weight (Apache-2.0 / MIT / open model licenses).
+
+[providers]
+default = "openrouter"
+
+[ingest]
+# Open-weight vision models vary on OpenRouter and the [models].vision slug below
+# may not exist in the live catalog. Vision is OFF here to avoid a failed call
+# each run; set a valid VL slug under [models].vision and flip this to "auto" to
+# enable schematic/pinout/bit-field figure extraction.
+vision = "off"
+
+[models]
+# Manager — planning / decomposition / strict JSON. Top open-weight coding-arena model.
+manager            = "z-ai/glm-5.1"
+# Engineer — generates .repl + C# peripheral models. Strong open-weight agentic coding.
+engineer           = "deepseek/deepseek-v4-pro"
+# Verifier — careful cross-checking against SVD/datasheet. Leading open-weight intelligence index.
+verifier           = "moonshotai/kimi-k2.6"
+# Tester — Robot tests + build orchestration. Strong, cheap reasoning.
+tester             = "deepseek/deepseek-v4-flash"
+# Failure classifier — bucket Renode logs into the defect taxonomy. Cheap + capable.
+failure_classifier = "deepseek/deepseek-v4-flash"
+# Vision — pinouts / schematics / bit-field figures. Open-weight multimodal.
+# (If unavailable, vision just degrades gracefully — set [ingest] vision="off".)
+vision             = "z-ai/glm-5v"
+# Embedder + reranker run LOCALLY (sentence-transformers / bge) — provider-independent.
+embedder           = "BAAI/bge-small-en-v1.5"
+reranker           = "cross-encoder/ms-marco-MiniLM-L-6-v2"  # ~80 MB; set [ingest] rerank=false to skip

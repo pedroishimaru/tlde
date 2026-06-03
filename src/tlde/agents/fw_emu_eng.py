@@ -11,13 +11,7 @@ verification agent and revise its outputs accordingly.
 """
 
 from tlde.config import AgentConfig
-
-PDF_READER_MCP = {
-    "pdf-reader": {
-        "command": "npx",
-        "args": ["@sylphx/pdf-reader-mcp"],
-    }
-}
+from tlde.ingest.mcp_config import kb_mcp_servers
 
 
 class FwEmuEng(AgentConfig):
@@ -40,10 +34,12 @@ class FwEmuEng(AgentConfig):
             model="claude-sonnet-4.6",
             description=(
                 "Firmware emulation engineer that produces Renode .repl platform "
-                "descriptions and peripheral models (Python/C#) from MCU datasheet "
-                "summaries. Accepts verification feedback to iteratively refine emulation."
+                "descriptions and peripheral models (Python/C#) from the grounded "
+                "datasheet model (tlde-kb MCP). Accepts verification feedback to "
+                "iteratively refine emulation."
             ),
-            mcp_servers=PDF_READER_MCP,
+            # Grounded retrieval over the cached, page-anchored DatasheetModel.
+            mcp_servers=kb_mcp_servers(),
             skills=self.BASE_SKILLS,
         )
         defaults.update(overrides)

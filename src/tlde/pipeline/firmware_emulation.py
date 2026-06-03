@@ -5,7 +5,7 @@ Runs the full emulation workflow:
   Phase 2: Engineer–Verifier loops per work unit (parallel where deps allow).
            Each unit gets an engineer that builds artifacts, then a verifier
            that cross-checks against vendor docs. Mismatches loop back to the
-           engineer for revision, up to MAX_VERIFY_RETRIES times.
+           engineer for revision, up to concurrency.verify_retries times.
   Phase 3: Test aggregator builds firmware samples, runs Robot Framework tests.
 """
 
@@ -17,16 +17,19 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from tlde.agent import run_agent, run_agent_interactive, _approve_all_handler
+from tlde import progress
+from tlde import settings
+from tlde.agent import (
+    run_agent,
+    run_agent_interactive,
+    ModelUnavailableError,
+    _approve_all_handler,
+    _test_permission_handler,
+)
 from tlde.agents import AGENTS
+from tlde.ingest import build_datasheet_model, IngestError
 from tlde.observability import PipelineTrace
 from tlde.rag import KnowledgeBase
-
-MAX_VERIFY_RETRIES = 3
-
-
-def _model_override():
-    return os.environ.get("TLDE_MODEL")
 
 
 @dataclass
@@ -45,25 +48,37 @@ class WorkUnitResult:
 async def main():
     if len(sys.argv) < 2:
         print("Usage: tlde <prompt> [--source URL_OR_PATH ...] [--plan work_plan.json]")
+        print("            [--config tlde.toml] [--provider NAME] [--model NAME]")
         print('\nExample: tlde "Emulate the nRF52833" --source https://example.com/spec.pdf')
         print('Resume:  tlde "Emulate the nRF52833" --plan output/work_plan.json')
+        print('Config:  tlde "Emulate the nRF52833" --provider openrouter --model z-ai/glm-5')
         sys.exit(1)
 
-    # Parse args: everything before --source/--plan is the prompt, rest are flags
+    # Parse args: bare words form the prompt; value-taking flags consume the next arg.
     args = sys.argv[1:]
-    prompt_parts = []
-    sources = []
+    prompt_parts: list[str] = []
+    sources: list[str] = []
     plan_file = None
+    config_path = "tlde.toml"
+    cli_overrides: dict[str, str] = {}
+
+    expect = None  # flag currently awaiting its value
     parsing_sources = False
     for arg in args:
+        if expect is not None:
+            if expect == "plan":
+                plan_file = arg
+            elif expect == "config":
+                config_path = arg
+            else:  # provider | model
+                cli_overrides[expect] = arg
+            expect = None
+            continue
         if arg == "--source":
             parsing_sources = True
-        elif arg == "--plan":
-            # Next arg is the plan JSON path
+        elif arg in ("--plan", "--config", "--provider", "--model"):
             parsing_sources = False
-            plan_file = "@@NEXT@@"
-        elif plan_file == "@@NEXT@@":
-            plan_file = arg
+            expect = arg[2:]
         elif parsing_sources:
             sources.append(arg)
         else:
@@ -74,27 +89,105 @@ async def main():
         print("Error: no prompt provided.")
         sys.exit(1)
 
+    # Load configuration: CLI flags > env/.env > tlde.toml > built-in defaults.
+    settings.init_settings(config_path=config_path, cli_overrides=cli_overrides)
+
     trace = PipelineTrace()
 
-    # --- Phase 0: Ingest sources into the knowledge base ---
-    kb = KnowledgeBase()
+    # --- Phase 0: Build the grounded datasheet model (fail-closed) ---
+    cfg = settings.get_settings()
+    kb = KnowledgeBase(
+        embedding_model=cfg.models.embedder,
+        reranker_model=cfg.models.reranker if cfg.ingest.rerank else None,
+        use_rerank=cfg.ingest.rerank,
+    )
 
-    # Auto-extract URLs from the prompt as sources
+    # Sources come from tlde.toml [sources]; CLI --source and any URLs in the
+    # prompt are merged in as extras.
     urls_in_prompt = re.findall(r'https?://[^\s"\'<>]+', user_prompt)
-    all_sources = list(dict.fromkeys(sources + urls_in_prompt))  # deduplicate
+    extra_sources = list(dict.fromkeys(sources + urls_in_prompt))
 
-    if all_sources:
-        print("[Phase 0: Ingest] Loading reference documents into knowledge base")
-        print("-" * 60)
-        for src in all_sources:
-            print(f"  Ingesting: {src}")
+    # Optional autonomous web research: discover + fetch missing machine-readable
+    # inputs from the trust allowlist. Offline-safe (no-ops without a backend).
+    if cfg.research.mode != "off":
+        from tlde import research as _research
+        from tlde.research.types import source_type_for
+        configured = {source_type_for(s) for s in extra_sources}
+        for t in ("svd", "dts", "header"):
+            if getattr(cfg.sources, t, None):
+                configured.add(t)
+        missing = [t for t in ("svd", "dts", "header") if t not in configured]
+        if missing:
+            rres = await _research.gather_inputs(cfg, missing)
+            for note in rres.notes:
+                print(f"  [research] {note}")
+            extra_sources.extend(rres.paths)
+
+    print("[Phase 0: Ingest] Building grounded datasheet model")
+    print("-" * 60)
+    try:
+        build = build_datasheet_model(cfg, extra_sources=extra_sources, kb=kb)
+    except IngestError as e:
+        print(f"[Phase 0] ABORT (fail-closed): {e}")
+        print("Fix the source(s), provide an SVD/DTS, or set ingest.strictness "
+              "to 'quarantine'/'warn' in tlde.toml.")
+        sys.exit(1)
+
+    # URL sources feed retrieval (structured loaders handle only local files).
+    for src in extra_sources:
+        if src.startswith(("http://", "https://")):
             try:
                 n = await kb.ingest_source(src)
-                print(f"    → {n} chunks indexed")
+                print(f"  + {src}: {n} chunks")
             except Exception as e:
-                print(f"    → ERROR: {e}")
-        print(f"[Phase 0: Ingest] Knowledge base ready ({kb.chunk_count} total chunks)")
-        print("-" * 60)
+                if cfg.ingest.strictness == "fail_closed":
+                    print(f"[Phase 0] ABORT (fail-closed): failed to fetch {src}: {e}")
+                    sys.exit(1)
+                print(f"  ! {src}: {e}")
+
+    for w in build.gate.warnings:
+        print(f"  [warn] {w}")
+    if not build.gate.ok:
+        print(f"[Phase 0] ABORT (fail-closed): {build.gate.reason}")
+        print("Provide an SVD/DTS/header or a text PDF, enable vision/web-research, "
+              "or lower ingest.strictness in tlde.toml.")
+        sys.exit(1)
+
+    m = build.model
+    n_regs = sum(len(p.registers) for p in m.peripherals)
+    print(f"[Phase 0: Ingest] DatasheetModel ready: {len(m.peripherals)} peripherals, "
+          f"{n_regs} registers, {len(m.memory_map)} memory regions, "
+          f"{len(m.connectivity)} pins")
+    print(f"[Phase 0: Ingest] Grounding coverage: {m.coverage.overall_coverage:.0%} · "
+          f"retrieval KB: {kb.chunk_count} chunks")
+
+    # Phase 0b: vision augmentation — figures (pinouts/schematics/bit-fields) ->
+    # structured connectivity/bit-fields, validated against DTS/SVD. Runs through
+    # the configured vision-capable model; with vision="auto" it degrades quietly
+    # when no vision model is available.
+    if cfg.ingest.vision != "off":
+        pdf_srcs = list(build.pages_by_source.keys())
+        if pdf_srcs:
+            from tlde.ingest import vision as _vision
+            try:
+                vfrag, vwarn = await _vision.augment(cfg, m, pdf_srcs)
+                for w in vwarn:
+                    print(f"  [vision] {w}")
+                added = _vision.merge_vision(m, vfrag)
+                if added:
+                    print(f"[Phase 0: Vision] merged {added} vision facts "
+                          f"({len(m.connectivity)} pins total)")
+                    kb.ingest_structured(m)
+            except Exception as e:
+                print(f"  [vision] skipped: {e}")
+
+    # Persist the grounded model + corpus and expose them to the tlde-kb MCP
+    # server subprocesses (they inherit this env), so agents query structured
+    # slices with citations instead of re-reading PDFs.
+    from tlde.ingest.cache import write_current
+    write_current(cfg.ingest.cache_dir, m, kb.export_corpus())
+    os.environ["TLDE_KB_DIR"] = str(Path(cfg.ingest.cache_dir).resolve())
+    print("-" * 60)
 
     # --- Phase 1: Manager decomposes the work (or load from cache) ---
     if plan_file:
@@ -119,7 +212,10 @@ async def main():
     # --- Phase 2: Engineer–Verifier loops (parallel where deps allow) ---
     results = await phase_engineer_verifier(target, work_units, user_prompt, trace, kb)
 
-    # --- Phase 3: Test aggregator builds + runs Robot Framework tests ---
+    # --- Phase 3: Binary-in-the-loop self-correction (complements samples) ---
+    bin_reports = await phase_binary_loop(board, m, trace)
+
+    # --- Phase 4: Test aggregator builds + runs Robot Framework tests (primary) ---
     test_report = await phase_testing(board, trace)
 
     # --- Summary ---
@@ -145,9 +241,8 @@ async def phase_manager(
     user_prompt: str, trace: PipelineTrace, kb: KnowledgeBase,
 ) -> dict:
     """Manager uses RAG context to produce a structured work plan."""
-    model = _model_override()
     manager = AGENTS["firmware_emulation_manager"](
-        **({"model": model} if model else {}),
+        **settings.for_role("firmware_emulation_manager"),
     )
     print(f"[Phase 1: Manager] Running {manager.name} (model: {manager.model})")
     print(f"[Phase 1: Manager] Prompt: {user_prompt}")
@@ -209,7 +304,8 @@ async def phase_engineer_verifier(
     Work units are dispatched as soon as all their dependencies have completed.
     Each unit runs an engineer→verifier loop: if the verifier finds mismatches,
     the feedback is sent back to the engineer for another attempt, up to
-    MAX_VERIFY_RETRIES times.
+    concurrency.verify_retries times (configurable). Concurrent LLM work is
+    capped by concurrency.max_parallel_units.
     """
     board = target["board"]
     print(f"\n[Phase 2: Engineer–Verifier] Processing {len(work_units)} work units")
@@ -219,6 +315,13 @@ async def phase_engineer_verifier(
     completed_events: dict[str, asyncio.Event] = {
         unit["name"]: asyncio.Event() for unit in work_units
     }
+
+    # Cap concurrent LLM work; the cap is acquired only after dependency waits
+    # so that a unit blocked on a dependency never holds a permit (no deadlock).
+    conc = settings.get_settings().concurrency
+    max_retries = conc.verify_retries
+    sem = asyncio.Semaphore(conc.max_parallel_units)
+
     async def process_unit(unit: dict) -> WorkUnitResult:
         name = unit["name"]
 
@@ -238,7 +341,7 @@ async def phase_engineer_verifier(
                 )
                 results[name] = result
                 completed_events[name].set()
-                print(f"[Phase 2] SKIPPED: {name} (dependency '{dep}' was skipped)")
+                progress.write(f"[Phase 2] SKIPPED: {name} (dependency '{dep}' was skipped)")
                 return result
 
         # Collect dependency context
@@ -247,50 +350,51 @@ async def phase_engineer_verifier(
             if dep in results:
                 dep_context[dep] = results[dep].engineer_response
 
-        # Engineer–Verifier loop
+        # Engineer–Verifier loop (LLM work capped by the concurrency semaphore)
         engineer_response = ""
         verifier_response = ""
         verified = False
 
-        for attempt in range(1, MAX_VERIFY_RETRIES + 1):
-            # --- Engineer ---
-            print(f"\n[Phase 2: Engineer] {name} (attempt {attempt}/{MAX_VERIFY_RETRIES})")
-            if attempt == 1:
-                eng_prompt = build_engineer_prompt(unit, target, dep_context, kb)
-            else:
-                eng_prompt = build_engineer_revision_prompt(
-                    unit, target, engineer_response, verifier_response, kb,
+        async with sem:
+            for attempt in range(1, max_retries + 1):
+                # --- Engineer ---
+                progress.write(f"[Phase 2: Engineer] {name} (attempt {attempt}/{max_retries})")
+                if attempt == 1:
+                    eng_prompt = build_engineer_prompt(unit, target, dep_context, kb)
+                else:
+                    eng_prompt = build_engineer_revision_prompt(
+                        unit, target, engineer_response, verifier_response, kb,
+                    )
+
+                engineer = AGENTS["fw_emu_eng"](
+                    name=f"engineer-{name}-attempt{attempt}",
+                    **settings.for_role("fw_emu_eng"),
+                )
+                engineer_response = await run_agent(
+                    engineer, eng_prompt, pipeline_trace=trace,
+                )
+                progress.write(f"[Phase 2: Engineer] {name} built artifacts (attempt {attempt})")
+
+                # --- Verifier ---
+                progress.write(f"[Phase 2: Verifier] {name} (attempt {attempt}/{max_retries})")
+                verifier = AGENTS["fw_verif_eng"](
+                    name=f"verifier-{name}-attempt{attempt}",
+                    **settings.for_role("fw_verif_eng"),
+                )
+                ver_prompt = build_unit_verifier_prompt(unit, board, user_prompt, kb)
+                verifier_response = await run_agent(
+                    verifier, ver_prompt, pipeline_trace=trace,
                 )
 
-            engineer = AGENTS["fw_emu_eng"](
-                name=f"engineer-{name}-attempt{attempt}",
-                **({"model": _model_override()} if _model_override() else {}),
-            )
-            engineer_response = await run_agent(
-                engineer, eng_prompt, pipeline_trace=trace,
-            )
-            print(f"[Phase 2: Engineer] {name} built artifacts (attempt {attempt})")
-
-            # --- Verifier ---
-            print(f"[Phase 2: Verifier] {name} (attempt {attempt}/{MAX_VERIFY_RETRIES})")
-            verifier = AGENTS["fw_verif_eng"](
-                name=f"verifier-{name}-attempt{attempt}",
-                **({"model": _model_override()} if _model_override() else {}),
-            )
-            ver_prompt = build_unit_verifier_prompt(unit, board, user_prompt, kb)
-            verifier_response = await run_agent(
-                verifier, ver_prompt, pipeline_trace=trace,
-            )
-
-            verified = check_verification_passed(verifier_response)
-            if verified:
-                print(f"[Phase 2: Verifier] ✔ {name} verified on attempt {attempt}")
-                break
-            else:
-                print(f"[Phase 2: Verifier] ✗ {name} has mismatches (attempt {attempt})")
+                verified = check_verification_passed(verifier_response)
+                if verified:
+                    progress.write(f"[Phase 2: Verifier] ✔ {name} verified on attempt {attempt}")
+                    break
+                else:
+                    progress.write(f"[Phase 2: Verifier] ✗ {name} has mismatches (attempt {attempt})")
 
         if not verified:
-            print(f"[Phase 2] ✗ {name} NOT verified after {MAX_VERIFY_RETRIES} attempts")
+            progress.write(f"[Phase 2] ✗ {name} NOT verified after {max_retries} attempts")
 
         result = WorkUnitResult(
             name=name,
@@ -303,9 +407,20 @@ async def phase_engineer_verifier(
         completed_events[name].set()
         return result
 
-    # Launch all units concurrently — each waits for its own deps internally
-    tasks = [asyncio.create_task(process_unit(unit)) for unit in work_units]
+    # Launch all units concurrently — each waits for its own deps internally.
+    # A completion bar tracks finished units; per-unit logs use progress.write
+    # so they don't break the bar.
+    pbar = progress.bar(len(work_units), desc="[Phase 2] work units", unit="unit")
+
+    async def _tracked(unit: dict) -> WorkUnitResult:
+        try:
+            return await process_unit(unit)
+        finally:
+            pbar.update(1)
+
+    tasks = [asyncio.create_task(_tracked(unit)) for unit in work_units]
     await asyncio.gather(*tasks)
+    pbar.close()
 
     verified_count = sum(1 for r in results.values() if r.verified)
     total = len(work_units)
@@ -328,15 +443,83 @@ async def phase_testing(
     print("-" * 60)
 
     tester = AGENTS["emu_test_agg"](
-        **({"model": _model_override()} if _model_override() else {}),
+        **settings.for_role("emu_test_agg"),
     )
     prompt = build_tester_prompt(board)
-    response = await run_agent(tester, prompt, pipeline_trace=trace)
+    # Restricted handler: only mkdir + make/west/renode/renode-test/robot, not approve-all.
+    response = await run_agent(
+        tester, prompt, pipeline_trace=trace,
+        permission_handler=_test_permission_handler,
+    )
 
-    print(f"[Phase 3: Testing] Complete")
+    print(f"[Phase 4: Testing] Complete")
     print("-" * 60)
 
     return response
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Binary-in-the-loop self-correction (complements the samples Tester)
+# ---------------------------------------------------------------------------
+
+async def phase_binary_loop(board: str, model, trace: PipelineTrace) -> list:
+    """Run prebuilt binaries headless under Renode and self-correct model defects.
+
+    Empirical complement to the doc-grounded Verifier and the samples-build
+    Tester: the binary says *what* is wrong, fixes are re-grounded in tlde-kb.
+    """
+    cfg = settings.get_settings()
+    if not cfg.binaries.run_loop:
+        return []
+
+    from tlde import binloop
+
+    metas = binloop.discover(cfg.binaries.dir, board)
+    if not metas:
+        print(f"\n[Phase 3: Binary loop] no prebuilt binaries under "
+              f"{cfg.binaries.dir}/{board}/ — skipping (samples build remains primary)")
+        return []
+
+    print(f"\n[Phase 3: Binary loop] {len(metas)} binary(ies) for {board}")
+    print("-" * 60)
+    output_dir = f"output/{board}"
+    out = Path(output_dir)
+
+    async def engineer_revise(report: dict) -> set[str]:
+        before = {p.name: p.stat().st_mtime for p in out.glob("*") if p.is_file()}
+        engineer = AGENTS["fw_emu_eng"](
+            name=f"binfix-{report['binary']}", **settings.for_role("fw_emu_eng"),
+        )
+        await run_agent(engineer, build_binloop_revision_prompt(report, board),
+                        pipeline_trace=trace)
+        after = {p.name: p.stat().st_mtime for p in out.glob("*") if p.is_file()}
+        return {Path(n).stem for n, mt in after.items() if before.get(n) != mt}
+
+    async def refine(c):
+        agent = AGENTS["fw_failure_classifier"](
+            **settings.for_role("fw_failure_classifier"),
+        )
+        resp = await run_agent(agent, build_classifier_prompt(c), pipeline_trace=trace)
+        data = _extract_json(resp) or {}
+        if data.get("category"):
+            c.category = data["category"]
+            c.model_defect = bool(data.get("model_defect", c.model_defect))
+            c.peripheral_guess = data.get("peripheral_guess", c.peripheral_guess)
+            c.summary = f"LLM classifier: {data['category']}"
+        return c
+
+    reports = await binloop.run_binary_loop(
+        cfg, board, output_dir, model=model,
+        engineer_revise=engineer_revise, refine=refine,
+    )
+    print(binloop.summarize(reports))
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "binloop_report.json").write_text(
+        json.dumps([r.__dict__ for r in reports], indent=2, default=str)
+    )
+    print(f"[Phase 3: Binary loop] report → {out / 'binloop_report.json'}")
+    print("-" * 60)
+    return reports
 
 
 # ---------------------------------------------------------------------------
@@ -586,6 +769,37 @@ def build_tester_prompt(board: str) -> str:
     )
 
 
+def build_binloop_revision_prompt(report: dict, board: str) -> str:
+    """Build the engineer revision prompt from a binary-loop failure report."""
+    evidence = "\n".join(f"- {e}" for e in report.get("evidence", []) or [])
+    return (
+        f"# Binary-in-the-loop failure: `{report['binary']}` on `{board}`\n\n"
+        f"A prebuilt firmware was run headless under Renode against your generated "
+        f"model and FAILED with an empirical symptom. Fix the responsible peripheral.\n\n"
+        f"## Symptom (taxonomy)\n{report.get('symptom')}\n\n"
+        f"## Evidence (Renode log)\n{evidence or '- (none captured)'}\n\n"
+        f"## Faulting address\n{report.get('address')}\n"
+        f"## Likely peripheral\n{report.get('peripheral_guess')}\n\n"
+        f"## How to fix\n{report.get('instruction')}\n\n"
+        f"Query the `tlde-kb` MCP (`get_peripheral`/`get_register`) for the correct "
+        f"grounded value, update the `.repl` and/or C# model under `output/{board}/`, "
+        f"and emit COMPLETE files (not diffs). The binary tells you WHAT is wrong; "
+        f"tlde-kb tells you the correct VALUE — never hack a value just to pass."
+    )
+
+
+def build_classifier_prompt(classification) -> str:
+    """Build the failure-classifier prompt from an ambiguous Classification."""
+    return (
+        "Classify this headless Renode run. Respond with ONLY the JSON object "
+        "described in your instructions.\n\n"
+        f"## Heuristic guess\ncategory={classification.category} "
+        f"model_defect={classification.model_defect}\n\n"
+        f"## Renode log (tail)\n{classification.log}\n\n"
+        f"## Console UART (tail)\n{classification.uart or '(empty)'}\n"
+    )
+
+
 def parse_work_plan(response: str) -> dict:
     """Parse the manager's JSON response.
 
@@ -639,7 +853,11 @@ def _validate_plan(plan: dict) -> dict:
 
 def _cli():
     """CLI entry point for `tlde` command."""
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except ModelUnavailableError as e:
+        print(f"\n[ERROR] {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

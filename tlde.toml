@@ -1,0 +1,74 @@
+# tlde project configuration.
+#
+# Precedence (highest first): CLI flags > environment (incl. .env) > this file > defaults.
+# Every value here is optional; deleting a key restores its built-in default.
+# Secrets (API keys) belong in .env or your shell environment — never here.
+
+[target]
+board = "bbc_microbit_v2"
+soc   = "nRF52833"
+arch  = "arm"
+cpu   = "cortex-m4f"
+
+[sources]
+# Explicit input documents (paths or URLs). Machine-readable inputs (svd/dts)
+# are the highest-signal sources; the PDF is used for behaviour and gap-filling.
+reference_manual = "docs/nRF52833.pdf"
+schematic        = "docs/microbit_v2_schematic.pdf"
+# svd  = "inputs/nrf52833.svd"
+# dts  = "inputs/microbit_v2.dts"
+extra      = []
+precedence = ["svd", "dts", "vendor_header", "renode_upstream", "reference_manual"]
+
+[research]
+# Autonomous discovery of missing inputs, restricted to the trust allowlist.
+mode        = "autonomous"        # autonomous | approval | off
+max_sources = 10
+allowlist   = [
+  "nordicsemi.com", "developer.arm.com", "arm.com",
+  "github.com/zephyrproject-rtos", "github.com/renode", "renode.io",
+]
+trust_tiers = { vendor = 1, arm_cmsis = 2, zephyr = 2, renode = 2, standards = 3, distributor = 4, community = 5 }
+
+[ingest]
+cache_dir    = ".tlde_cache"
+strictness   = "fail_closed"      # fail_closed | quarantine | warn
+min_coverage = 0.7
+chunking     = "table_aware"
+top_k        = 12
+rerank       = true
+vision       = "auto"             # auto | on | off
+
+[binaries]
+dir                  = "target_binaries"   # prebuilt ELF/HEX/BIN + meta.toml per binary
+run_loop             = true                # skipped gracefully if dir/<board>/ is empty
+max_attempts         = 4
+virtual_time_budget_s = 30
+default_success_tier = 1          # tier 1 = boot + no fault + no spin
+# renode_bin        = "/opt/renode/renode"  # auto-discovered if omitted
+wall_timeout_s       = 180        # hard wall-clock guard around each Renode run
+
+[testing]
+samples_build = true              # samples build/test stays primary; binary loop complements
+
+[concurrency]
+max_parallel_units = 4            # cap on parallel work units (was uncapped)
+verify_retries     = 3            # engineer<->verifier retries (was hardcoded)
+
+[models]
+# Per-role model selection (replaces the single global TLDE_MODEL).
+manager            = "claude-opus-4.8"
+engineer           = "claude-sonnet-4.6"
+verifier           = "claude-sonnet-4.6"
+tester             = "claude-sonnet-4.6"
+failure_classifier = "claude-sonnet-4.6"
+vision             = "claude-sonnet-4.6"
+embedder           = "BAAI/bge-small-en-v1.5"               # ~130 MB, runs locally
+reranker           = "cross-encoder/ms-marco-MiniLM-L-6-v2"  # ~80 MB (set rerank=false under [ingest] to skip)
+
+[providers]
+# default applies to every role; add a per-role key to override one role, e.g.
+#   vision = "anthropic"
+# NOTE: model IDs are provider-specific. To run on OpenRouter with open-weight
+# models, use the ready-made profile:  --config examples/tlde.openrouter.toml
+default = "github"                # github | openrouter | anthropic | openai | azure | ollama

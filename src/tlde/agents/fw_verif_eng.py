@@ -7,6 +7,7 @@ mismatches.
 """
 
 from tlde.config import AgentConfig
+from tlde.ingest.mcp_config import kb_mcp_servers
 
 
 class FirmwareVerificationEngineer(AgentConfig):
@@ -16,10 +17,14 @@ class FirmwareVerificationEngineer(AgentConfig):
             agent_type="fw_verif_eng",
             description=(
                 "Generates Renode .resc execution scripts and validates "
-                ".repl platform descriptions against vendor documentation. "
-                "Treats the .repl as untrusted input and cross-checks every "
-                "peripheral against the reference manual."
+                ".repl platform descriptions against the grounded datasheet "
+                "model / SVD (via the tlde-kb MCP). Treats the .repl as untrusted "
+                "input and cross-checks every peripheral's address/size/IRQ "
+                "against cited source facts."
             ),
+            # The verifier previously had NO grounding tool — give it tlde-kb so
+            # it cross-checks against the source of truth, not its own priors.
+            mcp_servers=kb_mcp_servers(),
             skills=[
                 "renode-resc-generation",
                 "renode-feedback-schema",
@@ -27,7 +32,9 @@ class FirmwareVerificationEngineer(AgentConfig):
                 "renode-debugging",
                 "zephyr-dts-analysis",
             ],
-            tools=["read_file", "write_file", "search_files"],
+            # tools=None ⇒ all built-in tools (read/write/search) plus the MCP
+            # tools are available, so the verifier can read artifacts, write its
+            # report, and query grounded facts.
         )
         defaults.update(overrides)
         super().__init__(**defaults)

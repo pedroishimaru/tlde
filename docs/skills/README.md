@@ -14,6 +14,7 @@ A collection of LLM-agent skills for generating Renode emulation artifacts. Thes
 | [Debugging](renode-debugging.md) | `renode-debugging.md` | Diagnosing emulation failures, unmapped accesses, boot hangs, IRQ issues |
 | [Zephyr DTS Analysis](zephyr-dts-analysis.md) | `zephyr-dts-analysis.md` | Extracting peripheral configuration from Zephyr build artifacts |
 | [MCUboot Emulation](mcuboot-emulation.md) | `mcuboot-emulation.md` | Setting up secure bootloader emulation, partition layouts, firmware updates |
+| [Feedback Schemas](renode-feedback-schema.md) | `renode-feedback-schema.md` | verification_report.json / doubt_log.json / revision & binary-loop feedback contracts; grounding via tlde-kb |
 
 ## Typical Workflow
 

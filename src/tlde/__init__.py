@@ -3,13 +3,13 @@
 from tlde.agent import run_agent, run_agent_interactive
 from tlde.config import AgentConfig
 from tlde.observability import PipelineTrace, SessionObserver, SessionTrace
-from tlde.providers import PROVIDERS, ProviderConfig, get_provider
+from tlde.providers import KNOWN_PROVIDERS, ProviderConfig, get_provider
 
 __all__ = [
     "AgentConfig",
+    "KNOWN_PROVIDERS",
     "PipelineTrace",
     "ProviderConfig",
-    "PROVIDERS",
     "SessionObserver",
     "SessionTrace",
     "get_provider",

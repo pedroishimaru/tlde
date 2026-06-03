@@ -2,6 +2,7 @@
 
 import asyncio
 import re
+import time
 from typing import Callable
 
 from copilot import CopilotClient
@@ -22,11 +23,12 @@ _ALLOWED_MKDIR = re.compile(r"^\s*mkdir(\s+-[pv]+)?\s+[^;&|$`]+$")
 # Blocks ; & | $ ` ( ) < > { }
 _SAFE_TOKEN = r"[^;&|$`()<>{}\s]+"
 
-# make -C <dir> with optional variables; renode-test <path>; west build <args>
+# make -C <dir> with optional variables; renode / renode-test <args>; west build <args>
 _ALLOWED_BUILD_AND_TEST = re.compile(
     rf"^\s*("
     rf"make(\s+-C\s+{_SAFE_TOKEN})?(\s+\w+={_SAFE_TOKEN})*(\s+-p\s+always)?(\s+{_SAFE_TOKEN})?"
     rf"|renode-test(\s+{_SAFE_TOKEN})+"
+    rf"|renode(\s+{_SAFE_TOKEN})+"
     rf"|python\s+-m\s+robot(\s+{_SAFE_TOKEN})+"
     rf"|west\s+build(\s+{_SAFE_TOKEN})*"
     rf")\s*$"
@@ -59,6 +61,27 @@ def _approve_all_handler(request, invocation):
     return PermissionRequestResult(kind="approve-once")
 
 
+class ModelUnavailableError(RuntimeError):
+    """Raised when a configured model isn't available for the chosen provider."""
+
+
+def _translate_session_error(e: Exception, config: AgentConfig) -> Exception:
+    """Turn an opaque 'model not available' JSON-RPC error into actionable guidance."""
+    msg = str(e)
+    if "not available" in msg.lower() or "unknown model" in msg.lower():
+        return ModelUnavailableError(
+            f"Model '{config.model}' for agent '{config.name}' "
+            f"(provider '{config.provider or 'github'}') is not available.\n"
+            f"  Fix: set a valid slug for this role in your config's [models] "
+            f"section.\n"
+            f"  For OpenRouter, list current IDs with:\n"
+            f"    curl -s https://openrouter.ai/api/v1/models | python -m json.tool | grep '\"id\"'\n"
+            f"  (model IDs change as the catalog updates — e.g. glm-5 → glm-5.1).\n"
+            f"  Original error: {msg}"
+        )
+    return e
+
+
 # Default handler — approve everything.
 _permission_handler = _approve_all_handler
 
@@ -89,19 +112,26 @@ Returns:
     provider = config.get_provider_dict()
 
     async with CopilotClient() as client:
-        async with await client.create_session(
-            on_permission_request=handler,
-            model=config.model,
-            mcp_servers=config.mcp_servers or None,
-            skill_directories=["~/.copilot/skills"],
-            custom_agents=[_agent_dict(config)],
-            agent=config.name,
-            provider=provider,
-        ) as session:
+        try:
+            session_ctx = await client.create_session(
+                on_permission_request=handler,
+                model=config.model,
+                mcp_servers=config.mcp_servers or None,
+                skill_directories=["~/.copilot/skills"],
+                custom_agents=[_agent_dict(config)],
+                agent=config.name,
+                provider=provider,
+            )
+        except Exception as e:
+            translated = _translate_session_error(e, config)
+            if translated is e:
+                raise
+            raise translated from e
+        async with session_ctx as session:
             observer = SessionObserver(config.name)
             observer.attach(session)
 
-            response = await _send_and_wait(session, prompt)
+            response = await _send_and_wait(session, prompt, label=config.name)
 
             trace = observer.finish()
             if pipeline_trace is not None:
@@ -140,25 +170,32 @@ Returns:
     provider = config.get_provider_dict()
 
     async with CopilotClient() as client:
-        async with await client.create_session(
-            on_permission_request=handler,
-            model=config.model,
-            mcp_servers=config.mcp_servers or None,
-            skill_directories=["~/.copilot/skills"],
-            custom_agents=[_agent_dict(config)],
-            agent=config.name,
-            provider=provider,
-        ) as session:
+        try:
+            session_ctx = await client.create_session(
+                on_permission_request=handler,
+                model=config.model,
+                mcp_servers=config.mcp_servers or None,
+                skill_directories=["~/.copilot/skills"],
+                custom_agents=[_agent_dict(config)],
+                agent=config.name,
+                provider=provider,
+            )
+        except Exception as e:
+            translated = _translate_session_error(e, config)
+            if translated is e:
+                raise
+            raise translated from e
+        async with session_ctx as session:
             observer = SessionObserver(config.name)
             observer.attach(session)
 
-            response = await _send_and_wait(session, initial_prompt)
+            response = await _send_and_wait(session, initial_prompt, label=config.name)
 
             while True:
                 feedback = get_feedback(response)
                 if feedback is None:
                     break
-                response = await _send_and_wait(session, feedback)
+                response = await _send_and_wait(session, feedback, label=config.name)
 
             trace = observer.finish()
             if pipeline_trace is not None:
@@ -167,8 +204,13 @@ Returns:
             return response
 
 
-async def _send_and_wait(session, prompt: str) -> str:
-    """Send a prompt and wait for the agent to finish, returning its response."""
+async def _send_and_wait(session, prompt: str, label: str = "agent",
+                         heartbeat_s: float = 20.0) -> str:
+    """Send a prompt and wait for the agent to finish, returning its response.
+
+    Emits a periodic heartbeat while waiting so a long (non-streaming) model
+    call is visibly *working* rather than appearing frozen.
+    """
     done = asyncio.Event()
     response_parts: list[str] = []
 
@@ -179,11 +221,23 @@ async def _send_and_wait(session, prompt: str) -> str:
             case SessionIdleData():
                 done.set()
 
+    async def _heartbeat():
+        from tlde.progress import write
+        t0 = time.monotonic()
+        try:
+            while True:
+                await asyncio.sleep(heartbeat_s)
+                write(f"  … {label} working ({int(time.monotonic() - t0)}s elapsed)")
+        except asyncio.CancelledError:
+            pass
+
     unsubscribe = session.on(on_event)
+    hb = asyncio.create_task(_heartbeat())
     try:
         await session.send(prompt)
         await done.wait()
     finally:
+        hb.cancel()
         unsubscribe()
 
     return "\n".join(response_parts)

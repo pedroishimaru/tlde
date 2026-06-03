@@ -1,4 +1,5 @@
 from tlde.config import AgentConfig
+from tlde.ingest.mcp_config import kb_mcp_servers
 
 
 class FirmwareEmulationManager(AgentConfig):
@@ -8,17 +9,12 @@ class FirmwareEmulationManager(AgentConfig):
             agent_type="firmware_emulation_manager",
             model="claude-opus-4.6",
             description=(
-                "Reads microcontroller PDF specs and decomposes the Renode "
-                "emulation work into self-contained units for "
-                "FirmwareEmulationEngineer agents."
+                "Reads the grounded datasheet model (via the tlde-kb MCP) and "
+                "decomposes the Renode emulation work into self-contained units "
+                "for FirmwareEmulationEngineer agents."
             ),
-            mcp_servers={
-                "pdf-reader": {
-                    "command": "npx",
-                    "args": ["@sylphx/pdf-reader-mcp"],
-                    "tools": ["*"],
-                },
-            },
+            # Grounded retrieval over the cached, page-anchored DatasheetModel.
+            mcp_servers=kb_mcp_servers(),
             skills=["renode-peripheral-catalogue"],
         )
         defaults.update(overrides)
